@@ -1,3 +1,13 @@
+//! ELF `DT_RPATH` repair for Linux build outputs.
+//!
+//! Build rules link against libraries that live in the build directory, while
+//! the copied-out artifact lives at a content-addressed store path. RPATH is
+//! the ELF indirection that bridges the two: this module resolves each needed
+//! library through the build directory and adds its store directory to the
+//! binary's RPATH.
+//!
+//! Darwin outputs use Mach-O load commands instead; see [`crate::macho`].
+
 use crate::derived_file::DerivedFile;
 use anyhow::{anyhow, Context as _, Result};
 use elf::endian::AnyEndian;

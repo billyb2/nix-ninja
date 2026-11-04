@@ -83,9 +83,22 @@ where
 {
     let includes = Arc::new(Vec::from(includes));
     let virtual_paths = Arc::new(virtual_paths.cloned());
-    let mut handles = Vec::new();
+    let mut handles: VecDeque<std::thread::JoinHandle<Result<SourceWithIncludes>>> =
+        VecDeque::new();
+    let max_in_flight = std::thread::available_parallelism()
+        .map(|count| count.get().min(8))
+        .unwrap_or(4);
+    let mut results = Vec::new();
 
     for entry in paths {
+        if handles.len() == max_in_flight {
+            let res = handles
+                .pop_front()
+                .unwrap()
+                .join()
+                .map_err(|_| anyhow!("Join error"))?;
+            results.push(res?);
+        }
         let path = match entry {
             Ok(value) => canonicalize_cached(value.clone(), virtual_paths.as_ref().as_ref())
                 .map_err(|e| anyhow!("{:?}", e))?
@@ -98,7 +111,7 @@ where
         let includes = includes.clone();
         let virtual_paths = virtual_paths.clone();
 
-        handles.push(std::thread::spawn(move || {
+        handles.push_back(std::thread::spawn(move || {
             let includes = match extract_includes(&path, &includes, virtual_paths.as_ref().as_ref())
             {
                 Ok(value) => value,
@@ -111,7 +124,6 @@ where
         }));
     }
 
-    let mut results = Vec::new();
     for handle in handles {
         let res = handle.join().map_err(|_| anyhow!("Join error"))?;
         results.push(res?);
@@ -121,7 +133,7 @@ where
 }
 
 static INCLUDE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r##"^\s*#\s*include\s*(["<])([^">]*)[">]"##).unwrap());
+    LazyLock::new(|| Regex::new(r##"^\s*#\s*(?:include|import)\s*(["<])([^">]*)[">]"##).unwrap());
 
 /// Given a C-like source, try to resolve includes.
 ///
@@ -219,4 +231,18 @@ where
     cache.insert(path.as_ref().to_path_buf(), result.clone());
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INCLUDE_REGEX;
+
+    #[test]
+    fn recognizes_include_and_objc_import() {
+        for directive in ["#include \"ProcessCheck.h\"", "#import \"ProcessCheck.h\""] {
+            let captures = INCLUDE_REGEX.captures(directive).expect(directive);
+            assert_eq!(captures.get(2).unwrap().as_str(), "ProcessCheck.h");
+        }
+        assert!(INCLUDE_REGEX.is_match("  #  import <Foundation/Foundation.h>"));
+    }
 }

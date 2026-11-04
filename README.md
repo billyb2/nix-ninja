@@ -34,12 +34,36 @@ system that outputs ninja like CMake, meson, premake, gn, etc.
 
 ## Getting started
 
-First you need to use Nix 2.30 or later (newer than stable) and enable the
-following experimental features:
+First you need a Nix that implements the `builder-rpc-v0` sandbox interface,
+which is newer than any released Nix: the daemon must support `AddToStoreScanning`
+and `SubmitOutput`, and derivations must be able to request it through
+`requiredSystemFeatures`. This flake pins such a Nix as its `nix` input; a stock
+Nix (2.32.4 at the time of writing) does not implement these operations.
+
+Enabling experimental features on a stock Nix is *not* sufficient: the daemon
+ignores client-supplied `experimental-features`, so `nix-command`,
+`dynamic-derivations` and `ca-derivations` must come from the daemon's own
+configuration, and the daemon must also be the pinned build.
 
 ```sh
 experimental-features = ["nix-command" "dynamic-derivations" "ca-derivations" "recursive-nix"]
 ```
+
+The same feature set must be available where derivations are instantiated, e.g.
+`NIX_CONFIG="extra-experimental-features = nix-command ca-derivations dynamic-derivations"`.
+
+nix-ninja drives native builds on `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`
+and `aarch64-darwin`. Task derivations take the platform of the machine running
+`nix-ninja`; on Darwin each output's Mach-O install names are repaired with
+`install_name_tool` and re-signed ad hoc (`codesign` from `darwin.sigtool`),
+mirroring how ELF RPATHs are repaired with `patchelf` on Linux.
+
+On Darwin, a CMake-generated graph with two shared libraries and an executable
+has been exercised with the pinned daemon. Commandless `phony` aliases can be
+dependencies of concrete targets, including CMake's object-order aliases;
+the `: &&` link prefix is also supported. Request a concrete output: an
+aggregate `phony` target is not yet a supported result. This bounded check
+does not establish compatibility with a full WebKit graph.
 
 Then you can try building the examples:
 

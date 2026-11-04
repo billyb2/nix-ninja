@@ -1359,6 +1359,7 @@ dependencies = [
  "harmonia-store-path",
  "harmonia-utils-hash",
  "include-graph",
+ "libc",
  "n2",
  "nix-builder-rpc-client",
  "nix-ninja-task",
@@ -1380,6 +1381,7 @@ dependencies = [
  "elf",
  "harmonia-store-derivation",
  "harmonia-store-path",
+ "nix-builder-rpc-client",
 ]
 
 [[package]]

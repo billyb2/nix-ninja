@@ -1,12 +1,12 @@
 use crate::local;
 use crate::relative_from::relative_from;
 use crate::subtool::dynamic_task;
-use anyhow::{anyhow, Context, Error, Result};
-use deps_infer::c_include_parser;
+use anyhow::{anyhow, bail, Context, Error, Result};
+use deps_infer::{c_include_parser, parse_include_dirs};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::derivation::{Derivation, DerivationOutput};
 use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
-use harmonia_store_derivation::placeholder::Placeholder;
+use harmonia_store_derivation::placeholder::{Placeholder, StorePathOrPlaceholder};
 use harmonia_store_path::{StoreDir, StorePath};
 use n2::{
     canon,
@@ -14,11 +14,12 @@ use n2::{
 };
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
+use nix_ninja_task::platform::Os;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env, fs,
     ops::Deref,
     path::{Path, PathBuf},
@@ -34,18 +35,48 @@ pub struct Tools {
     pub nix: StorePath,
     pub nix_ninja: StorePath,
     pub nix_ninja_task: StorePath,
-    pub patchelf: StorePath,
+    /// Rewrites ELF RPATHs. Linux only: `patchelf` does not understand Mach-O.
+    pub patchelf: Option<StorePath>,
+    /// Rewrites Mach-O install names and rpaths. Darwin only.
+    pub install_name_tool: Option<StorePath>,
+    /// Re-signs Mach-O binaries after their load commands changed. Darwin only;
+    /// optional because it is not part of the default stdenv tool set.
+    pub codesign: Option<StorePath>,
+    /// `codesign` needs an allocator from cctools to grow load commands.
+    pub codesign_allocate: Option<StorePath>,
 }
 
 impl Tools {
-    pub fn new(store_dir: &StoreDir) -> Result<Self> {
+    pub fn new(store_dir: &StoreDir, os: Os) -> Result<Self> {
+        let (patchelf, install_name_tool, codesign, codesign_allocate) = match os {
+            Os::Linux => (
+                Some(which_store_path(store_dir, "patchelf")?),
+                None,
+                None,
+                None,
+            ),
+            // A Darwin build may not link anything that needs Mach-O rewriting,
+            // so these are resolved leniently and only reported as missing if a
+            // task actually needs them. install_name_tool comes from cctools in
+            // the stdenv path; codesign comes from an explicit sigtool.
+            Os::Darwin => (
+                None,
+                which_optional_tool(store_dir, "install_name_tool")?,
+                which_optional_tool(store_dir, "codesign")?,
+                which_optional_tool(store_dir, "codesign_allocate")?,
+            ),
+        };
+
         Ok(Tools {
             cc: which_store_path(store_dir, "cc")?,
             coreutils: which_store_path(store_dir, "coreutils")?,
             nix: which_store_path(store_dir, "nix")?,
             nix_ninja: which_store_path(store_dir, "nix-ninja")?,
             nix_ninja_task: which_store_path(store_dir, "nix-ninja-task")?,
-            patchelf: which_store_path(store_dir, "patchelf")?,
+            patchelf,
+            install_name_tool,
+            codesign,
+            codesign_allocate,
         })
     }
 }
@@ -131,6 +162,15 @@ impl Runner {
                 || key.starts_with("NIX_LDFLAGS")
                 || key.starts_with("NIX_CC_WRAPPER")
                 || key.starts_with("NIX_BINTOOLS_WRAPPER")
+                || matches!(
+                    key.as_str(),
+                    "DEVELOPER_DIR"
+                        | "TOOLCHAINS"
+                        | "SDKROOT"
+                        | "NIX_NINJA_LINKAGE"
+                        | "NIX_NINJA_EXTRA_INPUTS"
+                        | "NIX_NINJA_TOOLCHAIN_FEATURE"
+                )
             {
                 wrapper_vars.insert(key, value);
             }
@@ -198,11 +238,13 @@ impl Runner {
         files: &mut graph::GraphFiles,
         bid: BuildId,
         build: &Build,
+        phony_files: &HashSet<FileId>,
+        flattened_ins: &[FileId],
     ) -> Result<()> {
         let tx = self.tx.clone();
 
         let tools = self.tools.clone();
-        let task = self.new_task(files, build)?;
+        let task = self.new_task(files, build, phony_files, flattened_ins)?;
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
@@ -299,9 +341,68 @@ impl Runner {
         fid
     }
 
-    fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
-        let store_dir = self.config.store_dir.to_string();
+    /// Adds one graph file to the task's input set.
+    ///
+    /// A file produced by an already-finished task is referenced through that
+    /// task's derived path. Any other file already exists in the build
+    /// directory and is exported to the store as an opaque object.
+    fn import_input(
+        &mut self,
+        files: &mut graph::GraphFiles,
+        store_dir: &str,
+        input_set: &mut HashMap<PathBuf, DerivedFile>,
+        fid: FileId,
+    ) -> Result<()> {
+        if let Some(input) = self.derived_files.get(&fid).cloned() {
+            input_set.insert(input.build_path.clone(), input);
+            return Ok(());
+        }
 
+        let path: PathBuf = {
+            let file = &files.by_id[fid];
+            // `build alias: phony || .` is CMake's "no additional dependency"
+            // marker, and n2 canonicalises `.` to itself. It names the build
+            // directory, so exporting it would snapshot the whole build tree;
+            // a directory is not a file input.
+            if file.name == "." {
+                return Ok(());
+            }
+            // The SDK is a host toolchain input on Darwin (sandboxing is off).
+            // Symlinking its absolute .tbd paths into a task would escape the
+            // temporary build root and attempt to write under /Applications.
+            if cfg!(target_os = "macos")
+                && file.name.starts_with("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/")
+                && file.name.ends_with(".tbd")
+            {
+                return Ok(());
+            }
+            if file.name.starts_with(store_dir) {
+                // TODO: Perhaps need to add this as inputSrc? But will also
+                // have to change DerivedFile to have source Option<PathBuf>,
+                // because we don't want it to be added to $NIX_NINJA_INPUTS.
+                // DerivedFile {
+                //     path: SingleDerivedPath::Opaque(StorePath::new(file.name)),
+                //     source: &file.name,
+                // }
+                return Ok(());
+            }
+            file.name.clone().into()
+        };
+
+        let input = new_opaque_file(&self.rpc_client, &self.config.build_dir, path)?;
+        self.add_derived_file(files, input.clone());
+        input_set.insert(input.build_path.clone(), input);
+
+        Ok(())
+    }
+
+    fn new_task(
+        &mut self,
+        files: &mut graph::GraphFiles,
+        build: &Build,
+        phony_files: &HashSet<FileId>,
+        flattened_ins: &[FileId],
+    ) -> Result<Task> {
         // Provide the task access to all the original files for explicit
         // inputs and implicit/explicit outputs.
         let mut build_files: HashMap<FileId, File> = HashMap::new();
@@ -309,37 +410,30 @@ impl Runner {
             build_files.insert(*fid, files.by_id[*fid].clone());
         }
 
+        let store_dir = self.config.store_dir.to_string();
+
         // Iterate over all explict, implicit and order-only dependencies as
         // they must all be linked into the derivation's source directory.
         let mut input_set: HashMap<PathBuf, DerivedFile> = HashMap::new();
         for fid in build.ordering_ins() {
-            // TODO: what about phony inputs?
-            let input = match self.derived_files.get(fid) {
-                Some(df) => df.to_owned(),
-                None => {
-                    let file = &files.by_id[*fid];
-                    if file.name.starts_with(&store_dir) {
-                        // TODO: Perhaps need to add this as inputSrc? But
-                        // will also have to change DerivedFile to have source
-                        // Option<PathBuf>, because we don't want it to be
-                        // added to $NIX_NINJA_INPUTS.
-                        // DerivedFile {
-                        //     path: SingleDerivedPath::Opaque(StorePath::new(file.name)),
-                        //     source: &file.name,
-                        // }
-                        continue;
-                    }
-
-                    let input = new_opaque_file(
-                        &self.rpc_client,
-                        &self.config.build_dir,
-                        file.name.clone().into(),
-                    )?;
-                    self.add_derived_file(files, input.clone().to_owned());
-                    input.to_owned()
-                }
-            };
-            input_set.insert(input.build_path.clone(), input.clone());
+            // A `phony` alias produces no file, so the alias itself is never
+            // imported; `flattened_ins` carries the generated files behind it.
+            if phony_files.contains(fid) {
+                continue;
+            }
+            self.import_input(files, &store_dir, &mut input_set, *fid)?;
+        }
+        for fid in flattened_ins {
+            // Generated files must already have a derived file: the scheduler
+            // only flattens inputs of builds that finished. A source file
+            // behind an alias is imported like any other opaque input.
+            if files.by_id[*fid].input.is_some() && !self.derived_files.contains_key(fid) {
+                bail!(
+                    "input {:?} behind a `phony` dependency has not been built",
+                    files.by_id[*fid].name
+                );
+            }
+            self.import_input(files, &store_dir, &mut input_set, *fid)?;
         }
 
         let mut outputs: Vec<PathBuf> = Vec::new();
@@ -358,6 +452,9 @@ impl Runner {
             let build_dir = &self.config.build_dir;
             if let Some(dir) = build_dir.to_str() {
                 cmdline = cmdline.replace(&format!("{dir}/"), "");
+                // The build root itself lacks a trailing slash, unlike its
+                // children. Keep CMake's `cd` inside this task's build tree.
+                cmdline = cmdline.replace(&format!("cd {dir} &&"), "cd . &&");
             }
             if let Some(dir) = build_dir.parent().and_then(|p| p.to_str()) {
                 cmdline = cmdline.replace(&format!("{dir}/"), "../");
@@ -373,8 +470,16 @@ impl Runner {
         // it as an explicit input.
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
-            for arg in args {
-                let Some(fid) = files.lookup(&arg) else {
+            for arg in &args {
+                // CMake's launcher and helper scripts can appear only in the
+                // command, not in a Ninja input list. Import them once as
+                // ordinary source inputs so tasks on other hosts have them.
+                if arg.starts_with("../src/") && self.config.build_dir.join(arg).is_file() {
+                    let fid = files.id_from_canonical(canon::to_owned_canon_path(arg.as_str()));
+                    self.import_input(files, &store_dir, &mut input_set, fid)?;
+                    continue;
+                }
+                let Some(fid) = files.lookup(arg) else {
                     continue;
                 };
                 let input = match self.derived_files.get(&fid) {
@@ -388,20 +493,40 @@ impl Runner {
                 };
                 input_set.insert(input.build_path.clone(), input.clone());
             }
+
+            // Forced headers are not necessarily Ninja inputs. Resolve only
+            // the ones the compiler names, including generated config headers
+            // found through -I, rather than attaching the whole build tree.
+            let include_dirs = parse_include_dirs(cmdline)?;
+            for header in args
+                .windows(2)
+                .filter(|pair| pair[0] == "-include")
+                .map(|pair| &pair[1])
+            {
+                for dir in
+                    std::iter::once(Path::new("")).chain(include_dirs.iter().map(PathBuf::as_path))
+                {
+                    let path = self.config.build_dir.join(dir).join(header);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Ok(relative) = path.strip_prefix(&self.config.build_dir) else {
+                        continue;
+                    };
+                    let name = relative
+                        .to_str()
+                        .context("forced include path is not UTF-8")?;
+                    let fid = files.id_from_canonical(canon::to_owned_canon_path(name));
+                    self.import_input(files, &store_dir, &mut input_set, fid)?;
+                    break;
+                }
+            }
         }
 
-        // TODO: Can we avoid this? Technically the build rule isn't complete.
-        //
-        // Currently need this because there are rules that depend on
-        // configuration phase generated files in Cpp Nix for example
-        // `src/libutil/config-util.hh` which has a command like:
-        // `-Isrc/libutil -include config-util.hh`.
-        //
-        // One way is to parse all the includes, then add it to our search
-        // path above.
-        for input in self.build_dir_inputs.values() {
-            input_set.insert(input.build_path.clone(), input.clone());
-        }
+        // Only explicit, command-referenced, and discovered compiler inputs
+        // belong to this task. Configuration outputs are indexed once by
+        // read_build_dir; copying all of them into every derivation inflated
+        // WebKit task environments beyond Darwin's process argument limit.
 
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         inputs.sort();
@@ -429,6 +554,37 @@ impl Runner {
             outputs,
         })
     }
+}
+
+/// Returns the first executable in a CMake/Ninja command, past the shell-only
+/// setup prefixes emitted by CMake. Unknown prefixes remain errors rather
+/// than being silently skipped.
+fn command_binary(cmdline: &str) -> Option<&str> {
+    let mut tokens = cmdline.split_whitespace().peekable();
+    while let Some(token) = tokens.peek().copied() {
+        match token {
+            ":" | "&&" => {
+                tokens.next();
+            }
+            "cd" => {
+                tokens.next();
+                if tokens.next().is_none() || tokens.next() != Some("&&") {
+                    return Some("cd");
+                }
+            }
+            "set" => {
+                tokens.next();
+                if tokens.next() != Some("-o")
+                    || tokens.next() != Some("pipefail")
+                    || tokens.next() != Some("&&")
+                {
+                    return Some("set");
+                }
+            }
+            _ => break,
+        }
+    }
+    tokens.next()
 }
 
 fn build_task_derivation(
@@ -476,6 +632,22 @@ fn build_task_derivation(
         );
     }
 
+    // Tasks and dynamic dependency scanners must use the same toolchain as
+    // the configured graph. An administrator advertises this host capability
+    // only after verifying the installed Xcode and SDK.
+    let mut features = String::from("builder-rpc-v0");
+    if let Some(feature) = task.wrapper_vars.get("NIX_NINJA_TOOLCHAIN_FEATURE") {
+        if feature.is_empty() || feature.split_whitespace().count() != 1 {
+            bail!("NIX_NINJA_TOOLCHAIN_FEATURE must be one nonempty system feature");
+        }
+        features.push(' ');
+        features.push_str(feature);
+    }
+    drv.env.insert(
+        b"requiredSystemFeatures"[..].into(),
+        features.into_bytes().into(),
+    );
+
     // Add pre-extracted store paths from cmdline and wrapper vars
     for store_path in &task.input_srcs {
         drv.inputs
@@ -489,23 +661,20 @@ fn build_task_derivation(
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
-    drv.inputs
-        .insert(SingleDerivedPath::Opaque(tools.patchelf.clone()));
 
     // Add all ninja build inputs.
-    let mut input_set: HashSet<String> = HashSet::new();
+    let mut input_set: HashMap<String, SingleDerivedPath> = HashMap::new();
     for input in &task.inputs {
-        // Declare input for derivation.
         drv.inputs.insert(input.derived_path.clone());
-
-        // Encode input for nix-ninja-task.
-        let encoded = &input.to_encoded(&task.store_dir);
-        input_set.insert(encoded.clone());
+        input_set.insert(
+            input.to_encoded(&task.store_dir),
+            input.derived_path.clone(),
+        );
     }
 
     // Handle when rule's dep = gcc, which means we need to find all the
     // implicit header dependencies normally handled by gcc's depfiles.
-    let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
+    // The include scanner may discover headers not declared by Ninja.
     if let Some(deps) = &task.deps {
         if deps == "gcc" {
             // Only opaque inputs are processed by gcc
@@ -537,68 +706,141 @@ fn build_task_derivation(
             for derived_file in discovered_deps {
                 let encoded = derived_file.to_encoded(&task.store_dir);
 
-                // Skip if already in input_set
-                if input_set.contains(&encoded) {
+                if input_set.contains_key(&encoded) {
                     continue;
                 }
 
-                input_set.insert(encoded);
-                drv.inputs.insert(derived_file.derived_path.clone());
-                discovered_inputs.push(derived_file);
+                input_set.insert(encoded, derived_file.derived_path.clone());
+                drv.inputs.insert(derived_file.derived_path);
             }
         }
     }
 
-    // Sort NIX_NINJA_INPUTS to ensure determinism.
-    let mut inputs: Vec<String> = input_set.into_iter().collect();
-    inputs.sort();
+    // Keep normal tasks compact. Large link steps need a manifest: macOS
+    // cannot exec a builder with a multi-megabyte NIX_NINJA_INPUTS value.
+    let mut inputs: Vec<_> = input_set.into_iter().collect();
+    inputs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    if inputs
+        .iter()
+        .map(|(encoded, _)| encoded.len() + 1)
+        .sum::<usize>()
+        > 100_000
+    {
+        add_input_manifests(&mut drv, rpc_client, &tools, &task.store_dir, inputs)?;
+    } else {
+        drv.env.insert(
+            b"NIX_NINJA_INPUTS"[..].into(),
+            inputs
+                .into_iter()
+                .map(|(encoded, _)| encoded)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .into_bytes()
+                .into(),
+        );
+    }
 
-    drv.env.insert(
-        b"NIX_NINJA_INPUTS"[..].into(),
-        inputs.join(" ").into_bytes().into(),
-    );
-
-    // Add all ninja build outputs.
-    let mut outputs: Vec<String> = Vec::new();
+    // Multi-output edges can exceed Darwin's single environment value limit.
+    // The static manifest stores output variable names, not placeholders;
+    // nix-ninja-task resolves each name after Nix assigns its output path.
+    let file_outputs = task
+        .outputs
+        .iter()
+        .map(|path| path.to_string_lossy().len() * 2 + 128)
+        .sum::<usize>()
+        > 100_000;
+    let mut outputs: Vec<String> = Vec::with_capacity(task.outputs.len());
     for output_path in &task.outputs {
-        // Declare a content addressed output.
         let normalized_name = normalize_output(&output_path.to_string_lossy());
+        let output_name = OutputName::from_str(&normalized_name)?;
         drv.outputs.insert(
-            normalized_name.parse()?,
+            output_name.clone(),
             DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(
                 harmonia_utils_hash::Algorithm::SHA256,
             )),
         );
 
-        // Create a placeholder and encode output for nix-ninja-task.
-        let placeholder = Placeholder::standard_output(
-            &OutputName::from_str(&normalized_name).context("While creating placeholder")?,
-        );
-        let encoded = format!(
+        let path = if file_outputs {
+            normalized_name
+        } else {
+            Placeholder::standard_output(&output_name)
+                .render()
+                .display()
+                .to_string()
+        };
+        outputs.push(format!(
             "{}:{}:{}",
-            placeholder.render().display(),
+            path,
             output_path.display(),
             output_path.display(),
-        );
-        outputs.push(encoded);
+        ));
     }
-    drv.env.insert(
-        b"NIX_NINJA_OUTPUTS"[..].into(),
-        outputs.join(" ").into_bytes().into(),
-    );
+    let encoded = outputs.join(" ");
+    if file_outputs {
+        let manifest = rpc_client.add_to_store_text("ninja-outputs", encoded.as_bytes())?;
+        drv.inputs
+            .insert(SingleDerivedPath::Opaque(manifest.clone()));
+        drv.env.insert(
+            b"NIX_NINJA_OUTPUTS_FILE"[..].into(),
+            task.store_dir
+                .display(&manifest)
+                .to_string()
+                .into_bytes()
+                .into(),
+        );
+    } else {
+        drv.env
+            .insert(b"NIX_NINJA_OUTPUTS"[..].into(), encoded.into_bytes().into());
+    }
 
     {
         // Prepare $PATH to have coreutils.
         let mut path: Vec<String> = vec![
             format!("{}/bin", task.store_dir.display(&tools.cc)),
             format!("{}/bin", task.store_dir.display(&tools.coreutils)),
-            format!("{}/bin", task.store_dir.display(&tools.patchelf)),
         ];
 
-        let cmdline_binary = cmdline
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow!("No command found in cmdline"))?;
+        // Linkage repair needs the tools of this platform's object format; the
+        // ones that do not apply are absent from `tools` and stay out of the
+        // derivation entirely.
+        for tool in [
+            &tools.patchelf,
+            &tools.install_name_tool,
+            &tools.codesign,
+            &tools.codesign_allocate,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            drv.inputs.insert(SingleDerivedPath::Opaque(tool.clone()));
+            path.push(format!("{}/bin", task.store_dir.display(tool)));
+        }
+
+        // nixpkgs' sigtool `codesign` execs this to grow load commands, so it
+        // takes the executable path, not the store path of its package.
+        if let Some(codesign_allocate) = &tools.codesign_allocate {
+            drv.env.insert(
+                b"CODESIGN_ALLOCATE"[..].into(),
+                format!(
+                    "{}/bin/codesign_allocate",
+                    task.store_dir.display(codesign_allocate)
+                )
+                .into_bytes()
+                .into(),
+            );
+        }
+
+        if cfg!(target_os = "macos") {
+            // Darwin tasks intentionally use the host Xcode/SDK outside the
+            // sandbox. CMake invokes Apple tools by bare name in some rules.
+            path.extend([
+                "/Applications/Xcode.app/Contents/Developer/usr/bin".to_owned(),
+                "/usr/bin".to_owned(),
+                "/bin".to_owned(),
+            ]);
+        }
+        let cmdline_binary = command_binary(cmdline)
+            .ok_or_else(|| anyhow!("No command found in cmdline: {cmdline}"))?;
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
         // from the source tree) is a task input handled by
@@ -620,6 +862,108 @@ fn build_task_derivation(
     Ok(drv)
 }
 
+// Each helper gets at most 64 KiB of placeholder-bearing environment data.
+// Nix expands those placeholders when building the helper; storing the raw
+// placeholder strings in a text path would leave them unresolved.
+fn add_input_manifests(
+    drv: &mut Derivation,
+    rpc_client: &Arc<BuilderRpcClient>,
+    tools: &Tools,
+    store_dir: &StoreDir,
+    inputs: Vec<(String, SingleDerivedPath)>,
+) -> Result<()> {
+    let mut manifests = Vec::new();
+    let mut entries = Vec::new();
+    let mut dependencies = BTreeSet::new();
+    let mut size = 0;
+    for (encoded, dependency) in inputs {
+        if size + encoded.len() + 1 > 64 * 1024 && !entries.is_empty() {
+            manifests.push(add_input_manifest(
+                drv,
+                rpc_client,
+                tools,
+                store_dir,
+                entries,
+                dependencies,
+            )?);
+            entries = Vec::new();
+            dependencies = BTreeSet::new();
+            size = 0;
+        }
+        size += encoded.len() + 1;
+        entries.push(encoded);
+        dependencies.insert(dependency);
+    }
+    if !entries.is_empty() {
+        manifests.push(add_input_manifest(
+            drv,
+            rpc_client,
+            tools,
+            store_dir,
+            entries,
+            dependencies,
+        )?);
+    }
+    drv.env.insert(
+        b"NIX_NINJA_INPUTS_FILES"[..].into(),
+        manifests.join(" ").into_bytes().into(),
+    );
+    Ok(())
+}
+
+fn add_input_manifest(
+    drv: &mut Derivation,
+    rpc_client: &Arc<BuilderRpcClient>,
+    tools: &Tools,
+    store_dir: &StoreDir,
+    entries: Vec<String>,
+    dependencies: BTreeSet<SingleDerivedPath>,
+) -> Result<String> {
+    let encoded = entries.join(" ");
+    let digest = format!("{:x}", Sha256::digest(encoded.as_bytes()));
+    let mut manifest = Derivation::new(
+        format!("nix-ninja-inputs-{}", &digest[..16]).parse()?,
+        drv.platform.clone(),
+        format!(
+            "{}/bin/nix-ninja-task",
+            store_dir.display(&tools.nix_ninja_task)
+        )
+        .into_bytes()
+        .into(),
+    );
+    manifest.args.push(b"--write-inputs-manifest"[..].into());
+    manifest.outputs.insert(
+        OutputName::default(),
+        DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::Text),
+    );
+    manifest.env.insert(
+        b"out"[..].into(),
+        Placeholder::standard_output(&OutputName::default())
+            .render()
+            .into_os_string()
+            .into_encoded_bytes()
+            .into(),
+    );
+    manifest
+        .env
+        .insert(b"NIX_NINJA_INPUTS"[..].into(), encoded.into_bytes().into());
+    manifest.inputs = dependencies;
+    manifest
+        .inputs
+        .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
+
+    let path = rpc_client.add_drv_to_store(store_dir, &manifest)?;
+    let built = SingleDerivedPath::Built {
+        drv_path: Arc::new(SingleDerivedPath::Opaque(path)),
+        output: OutputName::default(),
+    };
+    let resolved = store_dir
+        .display(&StorePathOrPlaceholder::from(&built))
+        .to_string();
+    drv.inputs.insert(built);
+    Ok(resolved)
+}
+
 // For dynamic tasks, we generate an intermediary derivation that will then
 // generate the final derivation with any discovered dependencies from its
 // dependencies.
@@ -635,8 +979,13 @@ fn build_dynamic_task_derivation(
     input_drv: Derivation,
     built_inputs: Vec<DerivedFile>,
 ) -> Result<Derivation> {
+    let wrapper_name = if input_drv.name == "ninja-build" {
+        "ninja-build.drv".to_owned()
+    } else {
+        format!("{}.drv", input_drv.name)
+    };
     let mut drv = Derivation::new(
-        format!("{}.drv", input_drv.name).parse()?,
+        wrapper_name.parse()?,
         input_drv.platform.clone(),
         format!("{}/bin/nix-ninja", store_dir.display(&tools.nix_ninja))
             .into_bytes()
@@ -693,6 +1042,13 @@ fn build_dynamic_task_derivation(
     drv.inputs
         .insert(SingleDerivedPath::Opaque(src_store_path.clone()));
 
+    if let Some(paths) = input_drv.env.get(&b"NIX_NINJA_EXTRA_INPUTS"[..]) {
+        for path in std::str::from_utf8(paths)?.split_whitespace() {
+            drv.inputs
+                .insert(SingleDerivedPath::Opaque(store_dir.parse(path)?));
+        }
+    }
+
     // Set up PATH to include nix binary
     let path = format!("{}/bin", store_dir.display(&tools.nix));
     drv.env.insert(b"PATH"[..].into(), path.into_bytes().into());
@@ -707,10 +1063,12 @@ fn build_dynamic_task_derivation(
     // where the daemon socket is bind-mounted in restricted mode (see
     // NixOS/nix#15793). nix-ninja's inside-sandbox calls then go through
     // the worker protocol's restricted allowlist instead of recursive-nix.
-    drv.env.insert(
-        b"requiredSystemFeatures"[..].into(),
-        b"builder-rpc-v0"[..].into(),
-    );
+    let features = input_drv
+        .env
+        .get(&b"requiredSystemFeatures"[..])
+        .context("dynamic task has no required system features")?;
+    drv.env
+        .insert(b"requiredSystemFeatures"[..].into(), features.clone());
 
     // Serialize the derivation and add it to the nix store
     let drv_json = serde_json::to_string(&input_drv)?;
@@ -814,9 +1172,26 @@ pub fn which_store_path(store_dir: &StoreDir, binary_name: &str) -> Result<Store
 fn which_store_path_opt(store_dir: &StoreDir, binary_name: &str) -> Result<Option<StorePath>> {
     let binary_path =
         which(binary_name).map_err(|err| anyhow!("Failed to find {}: {}", binary_name, err))?;
+    store_path_for_binary(store_dir, binary_name, &binary_path)
+}
 
+/// Like [`which_store_path_opt`], but also returns `None` when the binary is
+/// not on `$PATH` at all. Used for tools that only some builds need.
+fn which_optional_tool(store_dir: &StoreDir, binary_name: &str) -> Result<Option<StorePath>> {
+    match which(binary_name) {
+        Ok(binary_path) => store_path_for_binary(store_dir, binary_name, &binary_path),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Maps a resolved binary to the store path that contains it.
+fn store_path_for_binary(
+    store_dir: &StoreDir,
+    binary_name: &str,
+    binary_path: &Path,
+) -> Result<Option<StorePath>> {
     // Canonicalize will resolve all symlinks and return an absolute path
-    let canonical_path = std::fs::canonicalize(&binary_path).with_context(|| {
+    let canonical_path = std::fs::canonicalize(binary_path).with_context(|| {
         format!(
             "canonicalize {} (from PATH lookup of {})",
             binary_path.display(),
@@ -878,11 +1253,9 @@ fn new_opaque_file(
     // AddTempRoot which the daemon refuses. Upload as a NAR-hashed CA
     // object instead, which (unlike a text-CA object) preserves the file
     // mode, notably the executable bit.
-    let name = canonical_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "source".to_string());
-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    // The NAR hash identifies the file; build_path retains its original name.
+    // Source basenames can contain characters Nix rejects in store path names.
+    let store_path = rpc_client.add_to_store_nar("source", &canonical_path)?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
@@ -903,10 +1276,19 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
     }
 }
 
-// Derivation outputs cannot have `/` in them as its suffixed to the derivation
-// store path.
+// Derivation output names accept only Nix's store-name characters, not every
+// character allowed in source filenames (e.g. WebKit's @2x image assets).
 fn normalize_output(output: &str) -> String {
-    output.replace('/', "-")
+    output
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | '_' | '?' | '=') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Discovers C include dependencies from a command line and input files.

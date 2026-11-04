@@ -4,11 +4,12 @@ use anyhow::{anyhow, Result};
 use harmonia_store_path::StoreDir;
 use n2::densemap::DenseMap;
 use n2::graph::{Build, BuildId, FileId, Graph};
-use n2::{canon, load, scanner};
+use n2::{canon, load, parse, scanner};
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
-use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use nix_ninja_task::platform;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct BuildConfig {
@@ -23,15 +24,20 @@ pub fn build(
     config: BuildConfig,
     rpc_client: &Arc<BuilderRpcClient>,
 ) -> Result<DerivedFile> {
-    let mut loader = load_file(build_filename)?;
+    let (mut loader, phony_builds) = load_file(build_filename)?;
 
-    let tools = task::Tools::new(&config.store_dir)?;
+    // Task derivations are built by the machine evaluating the graph, so they
+    // take its platform. This was hardcoded to x86_64-linux, which made every
+    // task of a Darwin build request a Linux builder.
+    let os = platform::host_os();
+    let system = platform::host_system();
+    let tools = task::Tools::new(&config.store_dir, os)?;
 
     let mut runner = task::Runner::new(
         tools,
         rpc_client.clone(),
         task::RunnerConfig {
-            system: "x86_64-linux".to_string(),
+            system,
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
@@ -39,7 +45,7 @@ pub fn build(
     )?;
     runner.read_build_dir(&mut loader.graph.files)?;
 
-    let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
+    let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner, phony_builds);
 
     // TODO: Support multiple targets, probably treat it like a dynamically
     // generated phony target.
@@ -49,7 +55,18 @@ pub fn build(
     let fid = scheduler
         .lookup(name)
         .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
-    let _ = scheduler.want_file(fid);
+
+    // This entry point returns the derivation for a single target. A root
+    // `phony` target aggregates other targets instead of producing a file, so
+    // there is no derivation to return for it.
+    if scheduler.is_phony_file(fid) {
+        bail!(
+            "target {} is a `phony` alias; building an aggregate phony target is not supported",
+            name
+        );
+    }
+
+    scheduler.want_file(fid)?;
     scheduler.run()?;
 
     // println!("Successfully generated all derivations");
@@ -63,7 +80,10 @@ pub fn build(
     Ok(derived_file.clone())
 }
 
-fn load_file(build_filename: &str) -> Result<load::Loader> {
+/// Source lines of the `phony` builds in a graph file.
+type PhonyBuilds = HashMap<PathBuf, HashSet<usize>>;
+
+fn load_file(build_filename: &str) -> Result<(load::Loader, PhonyBuilds)> {
     let mut loader = load::Loader::new();
 
     let id = loader
@@ -77,9 +97,78 @@ fn load_file(build_filename: &str) -> Result<load::Loader> {
         Err(e) => bail!("read {}: {}", path.display(), e),
     };
 
-    loader.parse(path, &bytes)?;
+    loader.parse(path.clone(), &bytes)?;
+    let phony_builds = phony_build_locations(&loader.graph, &path, &bytes)?;
 
-    Ok(loader)
+    Ok((loader, phony_builds))
+}
+
+/// Records where the `phony` builds of a loaded graph were declared.
+///
+/// n2 keeps a build's evaluated command line but not its rule name, so once
+/// the graph is loaded a commandless build is indistinguishable from a
+/// `phony` alias. The rule token only exists while its file is parsed, so
+/// every file that declares a commandless build is scanned. The scanned paths
+/// come from the loaded builds themselves, which covers files reached through
+/// `include` and `subninja` without having to evaluate those directives.
+fn phony_build_locations(graph: &Graph, top_path: &Path, top_bytes: &[u8]) -> Result<PhonyBuilds> {
+    let mut files = HashSet::new();
+    for bid in graph.builds.all_ids() {
+        let build = &graph.builds[bid];
+        if build.cmdline.is_none() {
+            files.insert(build.location.filename.clone());
+        }
+    }
+
+    let mut locations = PhonyBuilds::new();
+    for filename in files {
+        let reread;
+        let bytes: &[u8] = if filename.as_path() == top_path {
+            top_bytes
+        } else {
+            reread = scanner::read_file_with_nul(filename.as_path())
+                .map_err(|e| anyhow!("read {}: {}", filename.display(), e))?;
+            &reread
+        };
+        record_phony_builds(filename.as_path(), bytes, &mut locations)?;
+    }
+
+    Ok(locations)
+}
+
+/// Adds the `phony` build declarations of one graph file to `locations`.
+fn record_phony_builds(path: &Path, bytes: &[u8], locations: &mut PhonyBuilds) -> Result<()> {
+    let mut parser = parse::Parser::new(bytes);
+    loop {
+        let statement = parser
+            .read()
+            .map_err(|err| anyhow!(parser.format_parse_error(path, err)))?;
+        let Some(statement) = statement else {
+            break;
+        };
+        if let parse::Statement::Build(build) = statement {
+            if build.rule == "phony" {
+                locations
+                    .entry(path.to_path_buf())
+                    .or_default()
+                    .insert(build.line);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns whether a loaded build was declared with the `phony` rule.
+///
+/// A `phony` rule has no `command`, and neither does a rule that simply omits
+/// one. Only the recorded declaration distinguishes the two, so a build that
+/// fails this check must not be treated as an alias.
+fn is_phony_build(build: &Build, phony_builds: &PhonyBuilds) -> bool {
+    build.cmdline.is_none()
+        && phony_builds
+            .get(build.location.filename.as_path())
+            .is_some_and(|lines| lines.contains(&build.location.line))
 }
 
 /// Build steps go through this sequence of states.
@@ -218,17 +307,41 @@ struct Scheduler<'a> {
     graph: &'a mut Graph,
     runner: &'a mut task::Runner,
     build_states: BuildStates,
+    /// Builds declared with the `phony` rule, by source location.
+    phony_builds: PhonyBuilds,
+    /// Files produced by those builds. They never get a derivation.
+    phony_files: HashSet<FileId>,
 }
 
 impl<'a> Scheduler<'a> {
-    fn new(graph: &'a mut Graph, runner: &'a mut task::Runner) -> Self {
+    fn new(graph: &'a mut Graph, runner: &'a mut task::Runner, phony_builds: PhonyBuilds) -> Self {
         let build_count = graph.builds.next_id();
+
+        let mut phony_files = HashSet::new();
+        for bid in graph.builds.all_ids() {
+            let build = &graph.builds[bid];
+            if is_phony_build(build, &phony_builds) {
+                phony_files.extend(build.outs().iter().copied());
+            }
+        }
 
         Scheduler {
             graph,
             runner,
             build_states: BuildStates::new(build_count),
+            phony_builds,
+            phony_files,
         }
+    }
+
+    fn is_phony(&self, bid: BuildId) -> bool {
+        is_phony_build(&self.graph.builds[bid], &self.phony_builds)
+    }
+
+    fn is_phony_file(&self, fid: FileId) -> bool {
+        self.graph.files.by_id[fid]
+            .input
+            .is_some_and(|bid| self.is_phony(bid))
     }
 
     pub fn lookup(&self, name: &str) -> Option<FileId> {
@@ -261,8 +374,8 @@ impl<'a> Scheduler<'a> {
         true
     }
 
-    // Given a build that just finished generating its derivation, check
-    // whether its dependent builds are now ready.
+    // Given a build that just finished, either by running its command or by
+    // being a `phony` alias, check whether its dependent builds are now ready.
     fn ready_dependents(&mut self, bid: BuildId) {
         let build = &self.graph.builds[bid];
         self.build_states.set(bid, BuildState::Done);
@@ -286,14 +399,92 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Collects the real files a task must consume through its `phony`
+    /// ordering dependencies.
+    ///
+    /// A `phony` alias has no command and produces no file, so it can only
+    /// order the builds and source files behind it. Both are real
+    /// prerequisites: by the time this task is ready every generated one has
+    /// finished, and a source one is a file the command may read. Aliases are
+    /// traversed rather than imported; directory markers such as CMake's `.`
+    /// are dropped when the collected inputs are imported.
+    fn phony_inputs(&self, build: &Build) -> Vec<FileId> {
+        let mut inputs = Vec::new();
+        let mut aliases = Vec::new();
+        for &fid in build.ordering_ins() {
+            if let Some(bid) = self.graph.files.by_id[fid].input {
+                if self.is_phony(bid) {
+                    aliases.push(bid);
+                }
+            }
+        }
+
+        let mut visited = HashSet::new();
+        while let Some(bid) = aliases.pop() {
+            if !visited.insert(bid) {
+                continue;
+            }
+            for &fid in self.graph.builds[bid].ordering_ins() {
+                match self.graph.files.by_id[fid].input {
+                    Some(dep) if self.is_phony(dep) => aliases.push(dep),
+                    _ => inputs.push(fid),
+                }
+            }
+        }
+
+        inputs
+    }
+
     fn run(&mut self) -> Result<()> {
+        // Derivation generation opens source files and daemon sockets; letting
+        // every ready Ninja edge spawn at once exhausts Darwin's fd limit.
+        let max_in_flight = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(4);
+        let mut in_flight = 0;
         while self.build_states.unfinished() {
             let mut made_progress = false;
             while let Some(bid) = self.build_states.pop_ready() {
+                if self.is_phony(bid) {
+                    // A `phony` alias becomes ready only once every build it
+                    // orders has finished. It has no command to run, so it is
+                    // done immediately and can unblock its dependents.
+                    self.ready_dependents(bid);
+                    made_progress = true;
+                    continue;
+                }
+
+                if in_flight == max_in_flight {
+                    let finished = self.runner.wait(&mut self.graph.files)?;
+                    in_flight -= 1;
+                    self.ready_dependents(finished);
+                }
                 let build = &self.graph.builds[bid];
+                if build.cmdline.is_none() {
+                    let outputs: Vec<&str> = build
+                        .outs()
+                        .iter()
+                        .map(|fid| self.graph.files.by_id[*fid].name.as_str())
+                        .collect();
+                    bail!(
+                        "{}:{}: build of {} has no command line and is not a `phony` rule; \
+                         refusing to treat it as a no-op",
+                        build.location.filename.display(),
+                        build.location.line,
+                        outputs.join(", "),
+                    );
+                }
                 self.build_states.set(bid, BuildState::Running);
+                let flattened_ins = self.phony_inputs(build);
                 // println!("Writing derivation for {:?} at {:?}", &bid, &build.location);
-                self.runner.start(&mut self.graph.files, bid, build)?;
+                self.runner.start(
+                    &mut self.graph.files,
+                    bid,
+                    build,
+                    &self.phony_files,
+                    &flattened_ins,
+                )?;
+                in_flight += 1;
                 made_progress = true;
             }
 
@@ -302,6 +493,7 @@ impl<'a> Scheduler<'a> {
             }
 
             let bid = self.runner.wait(&mut self.graph.files)?;
+            in_flight -= 1;
             // println!("Derivation for build {:?} has been written", &bid);
             self.ready_dependents(bid);
         }

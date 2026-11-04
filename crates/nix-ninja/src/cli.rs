@@ -69,6 +69,8 @@ pub fn run() -> Result<()> {
         println!("1.8.2");
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    ensure_fd_headroom()?;
 
     // Change directory if specified
     if let Some(dir) = &cli.dir {
@@ -88,6 +90,35 @@ pub fn run() -> Result<()> {
         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
     } else {
         local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_fd_headroom() -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid writable rlimit struct for this call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(anyhow!(
+            "getrlimit(RLIMIT_NOFILE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let requested = limit.rlim_max.min(4096);
+    if limit.rlim_cur < requested {
+        limit.rlim_cur = requested;
+        // SAFETY: `limit` came from getrlimit and only its soft bound is raised
+        // up to the kernel-reported hard bound; it remains valid for setrlimit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(anyhow!(
+                "setrlimit(RLIMIT_NOFILE): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     Ok(())
 }
@@ -118,8 +149,19 @@ fn submit_outer_output(
             final_drv_path.display()
         )
     })?;
+    let mut graph_drv = aterm::parse_derivation_aterm(store_dir, &bytes, outer_name.clone())
+        .context("parsing final graph derivation")?;
+    graph_drv.name = outer_name.clone();
+    let task_name = outer_name
+        .strip_suffix(".drv")
+        .unwrap_or(outer_name.as_ref())
+        .to_owned();
+    graph_drv
+        .env
+        .insert(b"name"[..].into(), task_name.into_bytes().into());
+    let graph_bytes = aterm::print_derivation_aterm(store_dir, &graph_drv);
     let renamed = rpc_client
-        .add_to_store_text(&canonical_name, &bytes)
+        .add_to_store_text(&canonical_name, &graph_bytes)
         .with_context(|| format!("re-uploading drv as {canonical_name}"))?;
     rpc_client
         .submit_output(&SingleDerivedPath::Opaque(renamed), &OutputName::default())

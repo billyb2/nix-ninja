@@ -51,6 +51,8 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
         println!("nix-ninja-dynamic-task: No new dependencies discovered");
     }
 
+    // The inner compiler task already has the correct derivation name for
+    // this dynamic output; the outer graph resolves it by output path.
     let drv_path = rpc_client.add_drv_to_store(store_dir, &drv)?;
 
     rpc_client.submit_output(

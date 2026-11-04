@@ -5,6 +5,9 @@
 , nix-ninja
 , nix-ninja-task
 , patchelf
+  # Ad-hoc re-signing, needed after nix-ninja-task rewrites Mach-O load
+  # commands. Only provided on Darwin.
+, sigtool ? null
 , stdenv
 }:
 
@@ -35,8 +38,14 @@ let
       nix
       nix-ninja
       nix-ninja-task
-      patchelf
-    ] ++ nativeBuildInputs;
+    ]
+    # nix-ninja-task repairs each output's runtime linkage with the tool of the
+    # platform's object format: patchelf for ELF RPATHs on Linux, and
+    # install_name_tool (from cctools, in the stdenv path) plus an ad-hoc
+    # re-signer for Mach-O load commands on Darwin.
+    ++ lib.optionals stdenv.hostPlatform.isLinux [ patchelf ]
+    ++ lib.optional (stdenv.hostPlatform.isDarwin && sigtool != null) sigtool
+    ++ nativeBuildInputs;
 
     requiredSystemFeatures = [ "builder-rpc-v0" ];
 
@@ -44,6 +53,12 @@ let
       export NIX_NINJA_DRV="true"
       export NINJA="${nix-ninja}/bin/nix-ninja"
       export NIX_CONFIG="extra-experimental-features = nix-command ca-derivations dynamic-derivations"
+    '' + lib.optionalString stdenv.hostPlatform.isDarwin ''
+      # After linking, nix-ninja-task rewrites Mach-O install names to full
+      # /nix/store paths, which are longer than the @rpath names Meson emits.
+      # The linker must reserve room for the grown load commands; nixpkgs sets
+      # this flag per-package for exactly the same reason.
+      export NIX_LDFLAGS="''${NIX_LDFLAGS:-} -headerpad_max_install_names"
     '';
 
     buildPhase = ''

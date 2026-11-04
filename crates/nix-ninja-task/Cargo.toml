@@ -11,3 +11,4 @@ clap = { version = "4.4", features = ["derive", "env"] }
 elf = "0.8"
 harmonia-store-derivation = { workspace = true }
 harmonia-store-path = { workspace = true }
+nix-builder-rpc-client = { path = "../nix-builder-rpc-client" }

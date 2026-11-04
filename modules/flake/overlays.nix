@@ -91,10 +91,15 @@
         inherit cargoArtifacts commonArgs src;
       };
 
-      mkMesonPackage = self.callPackage ./pkgs/mkMesonPackage {
+      mkMesonPackage = self.callPackage ./pkgs/mkMesonPackage ({
         inherit (self) nix-ninja nix-ninja-task;
         nix = inputs.nix.packages.${self.system}.nix;
-      };
+      }
+      # Mach-O outputs are re-signed after nix-ninja-task edits their load
+      # commands; sigtool provides that codesign.
+      // lib.optionalAttrs self.stdenv.hostPlatform.isDarwin {
+        inherit (self.darwin) sigtool;
+      });
 
       # meson --internal symbolextractor depends on readelf.
       # meson = super.meson.overrideAttrs(o: {
@@ -125,6 +130,8 @@
             "Cargo.{toml,lock}"
             "crates/nix-{libstore,ninja-task}/Cargo.toml"
             "crates/nix-{libstore,ninja-task}/**/*.rs"
+            "crates/nix-builder-rpc-client/Cargo.toml"
+            "crates/nix-builder-rpc-client/**/*.rs"
             "crates/deps-infer/Cargo.toml"
             "crates/deps-infer/**/*.rs"
           ];

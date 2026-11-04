@@ -29,6 +29,11 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 /// Env var the daemon sets inside a `builder-rpc-v0` sandbox.
 pub const SOCKET_ENV: &str = "NIX_REMOTE";
 
+/// Env var selecting the store directory the daemon client operates on.
+/// Mirrors the `nix-ninja` CLI's `--store-dir` env binding; the daemon still
+/// owns the actual store root, this only controls how store paths are built.
+pub const STORE_DIR_ENV: &str = "NIX_STORE";
+
 /// Fallback for when `$NIX_REMOTE` is unset — Nix's standard daemon socket path.
 const DEFAULT_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
@@ -48,6 +53,10 @@ pub enum Error {
     BuildFailed { path: String, error_msg: String },
     #[error("daemon returned no build result for {0}")]
     MissingBuildResult(String),
+    #[error("$NIX_STORE is not valid UTF-8")]
+    InvalidStoreDirEnv,
+    #[error("$NIX_STORE is not an absolute store directory: {0:?}")]
+    InvalidStoreDir(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -65,7 +74,9 @@ pub struct BuilderRpcClient {
 }
 
 impl BuilderRpcClient {
-    /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
+    /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon.
+    /// Store paths are built against `$NIX_STORE` when set, otherwise
+    /// `/nix/store` (harmonia's default).
     pub fn connect_from_env() -> Result<Self> {
         let path = match std::env::var(SOCKET_ENV) {
             Ok(remote) => parse_unix_remote(&remote)?,
@@ -80,12 +91,23 @@ impl BuilderRpcClient {
         // and has no purpose outside a nix derivation.
         let in_drv = std::env::var_os("NIX_BUILD_TOP").is_some();
 
-        Self::connect_unix(&path, in_drv)
+        Self::connect_unix_with_store_dir(&path, store_dir_from_env()?, in_drv)
     }
 
+    /// Connect to an explicit daemon socket, using the default store
+    /// directory (`/nix/store`).
     pub fn connect_unix(path: &Path, in_drv: bool) -> Result<Self> {
+        Self::connect_unix_with_store_dir(path, StoreDir::default(), in_drv)
+    }
+
+    /// Connect to an explicit daemon socket and store directory.
+    pub fn connect_unix_with_store_dir(
+        path: &Path,
+        store_dir: StoreDir,
+        in_drv: bool,
+    ) -> Result<Self> {
         let runtime = RuntimeBuilder::new_multi_thread().enable_all().build()?;
-        let pool = ConnectionPool::new(path, PoolConfig::default());
+        let pool = ConnectionPool::with_store_dir(path, store_dir, PoolConfig::default());
         Ok(Self {
             runtime,
             pool,
@@ -293,6 +315,25 @@ fn parse_unix_remote(remote: &str) -> Result<PathBuf> {
         return Ok(PathBuf::from(remote));
     }
     Err(Error::UnsupportedRemote(remote.to_string()))
+}
+
+/// Store directory the connection pool should use, from `$NIX_STORE`.
+/// Unset keeps harmonia's default store dir (`/nix/store`); malformed values
+/// are reported instead of silently falling back.
+fn store_dir_from_env() -> Result<StoreDir> {
+    match std::env::var(STORE_DIR_ENV) {
+        Ok(dir) => parse_store_dir(&dir),
+        Err(std::env::VarError::NotPresent) => Ok(StoreDir::default()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidStoreDirEnv),
+    }
+}
+
+fn parse_store_dir(dir: &str) -> Result<StoreDir> {
+    let path = PathBuf::from(dir);
+    if !path.is_absolute() {
+        return Err(Error::InvalidStoreDir(path));
+    }
+    StoreDir::new(path.clone()).map_err(|_| Error::InvalidStoreDir(path))
 }
 
 fn encode_nar(path: &Path) -> Result<Vec<u8>> {

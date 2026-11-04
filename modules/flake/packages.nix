@@ -20,15 +20,18 @@
     # The examples are dynamic derivations, which can only be instantiated
     # when the `dynamic-derivations` experimental feature is enabled (probed
     # via the feature-gated `builtins.outputOf`).
-    legacyPackages = lib.optionalAttrs (builtins ? outputOf) {
+    legacyPackages = lib.optionalAttrs (builtins ? outputOf) ({
       example-hello = pkgs.example-hello.target;
       example-header = pkgs.example-header.target;
       example-multi-source = pkgs.example-multi-source.target;
       example-shared-lib = pkgs.example-shared-lib.target;
       example-run-script = pkgs.example-run-script.target;
       example-dynamic-deps = pkgs.example-dynamic-deps.target;
+    } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+      # Building a Nix checkout pulls in Linux-only dependencies
+      # (libseccomp, libcpuid, busybox-sandbox-shell).
       example-nix = pkgs.example-nix.target;
-    };
+    });
 
     devShells.default = pkgs.craneLib.devShell {
       checks = self.checks.${system};

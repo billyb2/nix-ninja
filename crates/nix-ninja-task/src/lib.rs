@@ -1,2 +1,5 @@
 pub mod derived_file;
-pub mod patchelf;
+pub mod elf_rpath;
+pub mod linkage;
+pub mod macho;
+pub mod platform;
